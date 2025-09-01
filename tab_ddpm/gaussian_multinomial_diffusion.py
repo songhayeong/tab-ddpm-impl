@@ -115,3 +115,110 @@ class GaussianMultinomialDiffusion(torch.nn.Module):
 
         # Gaussian diffusion
 
+        self.posterior_variance = (
+            betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        )
+        self.posterior_variance_clipped = torch.from_numpy(
+            np.log(np.append(self.posterior_variance[1], self.posterior_variance[1:]))
+        ).float().to(device)
+        self.posterior_mean_coef1 = (
+            betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        ).float().to(device)
+        self.posterior_mean_coef2 = (
+            (1.0 - alphas_cumprod_prev) * np.sqrt(alphas.numpy()) / (1.0 - alphas_cumprod)
+        ).float().to(device)
+
+        assert log_add_exp(log_alpha, log_1_min_alpha).abs().sum().item() < 1.e-5
+        assert log_add_exp(log_cumprod_alpha, log_1_min_cumprod_alpha).abs().sum().item() < 1e-5
+        assert (np.cumsum(log_alpha) - log_cumprod_alpha).abs().sum().item() < 1.e-5
+
+        # Convert to float32 and register buffers.
+        self.register_buffer('alphas', alphas.float().to(device))
+        self.register_buffer('log_alpha', log_alpha.float().to(device))
+        self.register_buffer('log_1_min_alpha', log_1_min_alpha.float().to(device))
+        self.register_buffer('log_1_min_cumprod_alpha', log_1_min_cumprod_alpha.float().to(device))
+        self.register_buffer('log_cumprod_alpha', log_cumprod_alpha.float().to(device))
+        self.register_buffer('alphas_cumprod', alphas_cumprod.float().to(device))
+        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev.float().to(device))
+        self.register_buffer('alphas_cumprod_next', alphas_cumprod_next.float().to(device))
+        self.register_buffer('sqrt_alphas_cumprod', sqrt_alphas_cumprod.float().to(device))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', sqrt_one_minus_alphas_cumprod.float().to(device))
+        self.register_buffer('sqrt_recip_alphas_cumprod', sqrt_recip_alphas_cumprod.float().to(device))
+        self.register_buffer('sqrt_recipm1_alphas_cumprod', sqrt_recipm1_alphas_cumprod.float().to(device))
+
+        self.register_buffer('Lt_history', torch.zeros(num_timesteps))
+        self.register_buffer('Lt_count', torch.zeros(num_timesteps))
+
+    # Gaussian part
+    def gaussian_q_mean_variance(self, x_start, t):
+        mean = (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+        )
+        variance = extract(1.0 - self.alphas_cumprod, t, x_start.shape)
+        log_variance = extract(
+            self.log_1_min_cumprod_alpha, t, x_start.shape
+        )
+        return mean, variance, log_variance
+
+    def gaussian_q_sample(self, x_start, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        assert noise.shape == x_start.shape
+        return (
+            extract(self.sqrt_alpha_cumprod, t, x_start.shape) * x_start
+            + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+             * noise
+        )
+
+    def gaussian_q_posterior_mean_variance(self, x_start, x_t, t):
+        assert x_start.shape == x_t.shape
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start
+            + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract(
+            self.posterior_log_variance_clipped, t, x_t.shape
+        )
+        assert (
+            posterior_mean.shape[0]
+            == posterior_variance.shape[0]
+            == posterior_log_variance_clipped.shape[0]
+            == x_start.shape[0]
+        )
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def gaussian_p_mean_variance(
+            self, model_output, x, t, clip_denoised=False, denoised_fn=None, model_kwargs=None):
+        if model_kwargs is None:
+            model_kwargs = {}
+        B, C = x.shape[:2]
+        assert t.shape == (B,)
+
+        model_variance = torch.cat([self.posterior_variance[1].unsqueeze(0).to(x.device), (1. - self.alphas)[1:]], dim=0)
+        # model_variance = self.posterior_variance.to(device)
+        model_log_variance = torch.log(model_variance)
+
+        model_variance = extract(model_variance, t, x.shape)
+        model_log_variance = extract(model_log_variance, t, x.shape)
+
+        if self.gaussian_parameterization == 'eps':
+            pred_xstart = self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
+        elif self.gaussian_parameterization == 'x0':
+            pred_xstart = model_output
+        else:
+            raise NotImplementedError
+
+        model_mean,_,_ = self.gaussian_q_posterior_mean_variance(
+            x_start=pred_xstart, x_t=x, t=t
+        )
+        assert (
+            model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
+        ), f'{model_mean.shape}, {model_log_variance.shape}, {pred_xstart.shape}, {x.shape}'
+
+        return {
+            "mean":model_mean,
+            "variance":model_variance,
+            "log_variance":model_log_variance,
+            "pred_xstart": pred_xstart,
+        }
